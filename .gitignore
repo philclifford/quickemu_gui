@@ -55,7 +55,7 @@ app.*.map.json
 ####
 #
 .vscode
-.gitignore
+.gitignore*
 #  Leave this for upstream to manage
 #pubspec.yaml
 #  Leave this for upstream to manage
