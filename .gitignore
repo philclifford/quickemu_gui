@@ -50,3 +50,9 @@ app.*.map.json
 /*freebsd-*
 /*windows-*
 /*macos-*
+# screenshot workdir 
+/screenshots/work
+####
+#
+.vscode
+.gitignore
