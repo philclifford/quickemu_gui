@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:core';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as Path;
 import 'package:file_picker/file_picker.dart';
 import 'dart:io';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const MyApp());
@@ -52,21 +54,46 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
+class VmInfo {
+  String? sshPort;
+  String? spicePort;
+}
+
 class _MyHomePageState extends State<MyHomePage> {
 
   List<String> _currentVms = [];
-  List<String> _activeVms = [];
+  Map<String, VmInfo> _activeVms = {};
   List<String> _spicyVms = [];
   Timer? refreshTimer;
+  static const String prefsWorkingDirectory = 'workingDirectory';
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance
-        ?.addPostFrameCallback((_) => _getVms(context)); // Reload VM list when we enter the page.
+    _getCurrentDirectory();
+    Future.delayed(Duration.zero, () => _getVms(context));// Reload VM list when we enter the page.
     refreshTimer = Timer.periodic(Duration(seconds: 5), (Timer t) {
       _getVms(context);
     }); // Reload VM list every 15 seconds.
+  }
+
+  void _saveCurrentDirectory() async {
+    final prefs = await SharedPreferences.getInstance();
+    prefs.setString(prefsWorkingDirectory, Directory.current.path);
+  }
+
+  void _getCurrentDirectory() async {
+    final prefs = await SharedPreferences.getInstance();
+    // 2
+    if (prefs.containsKey(prefsWorkingDirectory)) {
+      // 3
+      setState(() {
+        final directory = prefs.getString(prefsWorkingDirectory);
+        if (directory != null) {
+          Directory.current = directory;
+        }
+      });
+    }
   }
 
   @override
@@ -75,9 +102,23 @@ class _MyHomePageState extends State<MyHomePage> {
     super.dispose();
   }
 
+  VmInfo _parseVmInfo(name) {
+    String shellScript = File(name + '/' + name + '.sh').readAsStringSync();
+    RegExpMatch? sshMatch = RegExp('hostfwd=tcp::(\\d+?)-:22').firstMatch(shellScript);
+    RegExpMatch? spiceMatch = RegExp('-spice.+?port=(\\d+)').firstMatch(shellScript);
+    VmInfo info = VmInfo();
+    if (sshMatch != null) {
+      info.sshPort = sshMatch.group(1);
+    }
+    if (spiceMatch != null) {
+      info.spicePort = spiceMatch.group(1);
+    }
+    return info;
+  }
+
   void _getVms(context) async {
     List<String> currentVms = [];
-    List<String> activeVms = [];
+    Map<String, VmInfo> activeVms = {};
 
     await for (var entity in
     Directory.current.list(recursive: false, followLinks: true)) {
@@ -86,15 +127,20 @@ class _MyHomePageState extends State<MyHomePage> {
         currentVms.add(name);
         File pidFile = File(name + '/' + name + '.pid');
         if (pidFile.existsSync()) {
-          String pid = pidFile.readAsStringSync();
-          if (Process.killPid(int.parse(pid), ProcessSignal.sigusr2)) {
-            activeVms.add(name);
+          String pid = pidFile.readAsStringSync().trim();
+          Directory procDir = Directory('/proc/' + pid);
+          if (procDir.existsSync()) {
+            if (_activeVms.containsKey(name)) {
+              activeVms[name] = _activeVms[name]!;
+            } else {
+              activeVms[name] = _parseVmInfo(name);
+            }
+
           }
         }
       }
     }
     currentVms.sort();
-    activeVms.sort();
     setState(() {
       _currentVms = currentVms;
       _activeVms = activeVms;
@@ -129,29 +175,43 @@ class _MyHomePageState extends State<MyHomePage> {
           String? result = await FilePicker.platform.getDirectoryPath();
           if (result != null) {
             Directory.current = result;
+            _saveCurrentDirectory();
             _getVms(context);
           }
         },
         child: Text(Directory.current.path)
       )
     );
-    _widgetList.addAll(
-      _currentVms.map(
-        (vm) {
+    List<List<Widget>> rows = _currentVms.map(
+            (vm) {
           return _buildRow(vm);
         }
-      ).toList()
-    );
+    ).toList();
+    for (var row in rows) {
+      _widgetList.addAll(row);
+    }
+
     return ListView(
         padding: const EdgeInsets.all(16.0),
         children: _widgetList,
     );
   }
 
-  Widget _buildRow(String currentVm) {
-    final active = _activeVms.contains(currentVm);
-    final spicy = _spicyVms.contains(currentVm);
-    return ListTile(
+  List<Widget> _buildRow(String currentVm) {
+    final bool active = _activeVms.containsKey(currentVm);
+    final bool spicy = _spicyVms.contains(currentVm);
+    String connectInfo = '';
+    if (active) {
+      VmInfo vmInfo = _activeVms[currentVm]!;
+      if (vmInfo.sshPort != null) {
+        connectInfo += 'SSH port: ' + vmInfo.sshPort! + ' ';
+      }
+      if (vmInfo.spicePort != null) {
+        connectInfo += 'SPICE port: ' + vmInfo.spicePort! + ' ';
+      }
+    }
+    return <Widget>[
+      ListTile(
         title: Text(currentVm),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
@@ -181,28 +241,67 @@ class _MyHomePageState extends State<MyHomePage> {
                   color: active ? Colors.green : null,
                   semanticLabel: active ? 'Running' : 'Run',
                 ),
-                onPressed: () {
-                  if (active) {
-                    Process.run('killall', [currentVm]);
-                    setState(() {
-                      _activeVms.remove(currentVm);
-                    });
-                  } else {
+                onPressed: () async {
+                  if (!active) {
+                    Map<String, VmInfo> activeVms = _activeVms;
                     List<String> args = ['--vm', currentVm + '.conf'];
                     if (spicy) {
                       args.addAll(['--display', 'spice']);
                     }
-                    Process.run('quickemu', args);
+                    await Process.start('quickemu', args);
+                    VmInfo info = _parseVmInfo(currentVm);
+                    activeVms[currentVm] = info;
                     setState(() {
-                      _activeVms.add(currentVm);
+                      _activeVms = activeVms;
                     });
                   }
                 }
-            )
+            ),
+            IconButton(
+                icon: Icon(
+                  active ? Icons.stop : Icons.stop_outlined,
+                  color: active ? Colors.red : null,
+                  semanticLabel: active ? 'Stop' : 'Not running',
+                ),
+                onPressed: () {
+                if (active) {
+                  showDialog<bool>(
+                    context: context,
+                    builder: (BuildContext context) => AlertDialog(
+                      title: const Text('Stop The Virtual Machine?'),
+                      content: Text(
+                          'You are about to terminate the virtual machine $currentVm'),
+                      actions: <Widget>[
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Cancel'),
+                        ),
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('OK'),
+                        ),
+                      ],
+                    ),
+                  ).then((result) {
+                    result = result ?? false;
+                    if (result) {
+                      Process.run('killall', [currentVm]);
+                      setState(() {
+                        _activeVms.remove(currentVm);
+                      });
+                    }
+                  });
+                }
+              },
+            ),
           ],
         )
-
-    );
+      ),
+      if (connectInfo.isNotEmpty) ListTile(
+          title: Text(connectInfo),
+      ),
+      const Divider()
+    ];
   }
 
   @override
@@ -306,6 +405,7 @@ class _QuickgetFormState extends State<QuickgetForm> {
       args.add(option);
     }
     var process = await Process.start('quickget', args);
+    process.stderr.transform(utf8.decoder).forEach(print);
     await process.exitCode;
     hideOpenDialog();
     Navigator.of(context).pop();
